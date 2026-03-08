@@ -36,17 +36,23 @@ def fetch_existing_emissions():
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
             docs = data.get('documents', [])
-            # Retourne un dict {calendar_event_id: firestore_doc_name}
-            result = {}
+            by_cal_id  = {}  # {calendarEventId: doc_name}
+            by_slot    = {}  # {titre+jour+heureDebut: doc_name}
             for doc in docs:
                 fields = doc.get('fields', {})
                 cal_id = fields.get('calendarEventId', {}).get('stringValue', '')
+                titre  = fields.get('titre',      {}).get('stringValue', '')
+                jour   = fields.get('jour',        {}).get('stringValue', '')
+                debut  = fields.get('heureDebut',  {}).get('stringValue', '')
                 if cal_id:
-                    result[cal_id] = doc['name']
-            return result
+                    by_cal_id[cal_id] = doc['name']
+                slot_key = f'{jour}|{debut}'
+                if slot_key:
+                    by_slot[slot_key] = doc['name']
+            return by_cal_id, by_slot
     except Exception as e:
         print(f'[firestore] Erreur lecture: {e}')
-        return {}
+        return {}, {}
 
 def upsert_emission(doc_id, data, existing_doc_name=None):
     """Crée ou met à jour une émission dans Firestore."""
@@ -88,10 +94,11 @@ def sync():
     creds   = get_credentials()
     service = build('calendar', 'v3', credentials=creds)
 
-    # Fenêtre : aujourd'hui → J+7
+    # Fenêtre : demain (J+1) → J+7 inclus (6 jours)
     now      = datetime.now(timezone.utc)
-    time_min = now.replace(hour=0, minute=0, second=0).isoformat()
-    time_max = (now + timedelta(days=7)).replace(hour=23, minute=59, second=59).isoformat()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    time_min = tomorrow.isoformat()
+    time_max = (tomorrow + timedelta(days=6)).replace(hour=23, minute=59, second=59).isoformat()
 
     print(f'[sync] Fenêtre: {time_min[:10]} → {time_max[:10]}')
 
@@ -106,7 +113,7 @@ def sync():
     events = events_result.get('items', [])
     print(f'[sync] {len(events)} événement(s) trouvé(s)')
 
-    existing = fetch_existing_emissions()
+    by_cal_id, by_slot = fetch_existing_emissions()
 
     synced = 0
     for event in events:
@@ -117,29 +124,22 @@ def sync():
         start = event.get('start', {})
         end   = event.get('end', {})
 
-        # Récupérer heure début/fin
         start_dt = start.get('dateTime') or start.get('date')
         end_dt   = end.get('dateTime')   or end.get('date')
 
         if not start_dt or not end_dt:
             continue
 
-        # Parser les dates
         start_obj = datetime.fromisoformat(start_dt.replace('Z', '+00:00'))
         end_obj   = datetime.fromisoformat(end_dt.replace('Z', '+00:00'))
 
-        # Convertir en heure locale France (UTC+1 ou UTC+2)
-        # Simple : utiliser l'heure telle quelle si déjà avec timezone
-        heure_debut = start_obj.strftime('%H:%M')
-        heure_fin   = end_obj.strftime('%H:%M')
-        jour        = JOURS_FR[start_obj.weekday()]
-
-        description = event.get('description', '') or ''
+        heure_debut  = start_obj.strftime('%H:%M')
+        heure_fin    = end_obj.strftime('%H:%M')
+        jour         = JOURS_FR[start_obj.weekday()]
+        description  = event.get('description', '') or ''
         cal_event_id = event.get('id', '')
-
-        # ID Firestore = basé sur l'ID Calendar (stable pour récurrents)
-        # Pour les récurrents, l'id contient _ suivi de la date
-        doc_id = cal_event_id.replace('_', '-')[:50]
+        # ID stable basé sur jour+heure uniquement (résiste aux changements de titre)
+        doc_id = f'{jour}-{heure_debut.replace(":", "h")}'
 
         data = {
             'titre':           title,
@@ -150,7 +150,9 @@ def sync():
             'calendarEventId': cal_event_id,
         }
 
-        existing_doc_name = existing.get(cal_event_id)
+        # Déduplication par jour+heure uniquement
+        slot_key = f'{jour}|{heure_debut}'
+        existing_doc_name = by_slot.get(slot_key) or by_cal_id.get(cal_event_id)
         upsert_emission(doc_id, data, existing_doc_name)
         synced += 1
 
